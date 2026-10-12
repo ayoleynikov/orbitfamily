@@ -82,69 +82,79 @@ final class FamilyTreeRepository {
         try await client.from("family_tree_links").delete().eq("id", value: id).execute()
     }
 
-    /// If the tree is empty, create a node per family member and heuristic parent/partner links.
+    /// Seed members into the tree when empty, and fill heuristic parent/partner links when links are missing.
     func seedFromMembersIfEmpty(session: FamilyTreeSession) async throws -> (persons: [FamilyTreePerson], links: [FamilyTreeLink]) {
         var persons = try await fetchPersons(familyId: session.familyId)
         var links = try await fetchLinks(familyId: session.familyId)
-        guard persons.isEmpty else { return (persons, links) }
         guard session.canEdit else { return (persons, links) }
+        guard persons.isEmpty || links.isEmpty else { return (persons, links) }
 
         var inserted: [UUID: FamilyTreePerson] = [:]
-        for member in session.members {
-            let photo = member.avatarURL ?? member.avatarPath
-            let person = try await insertPerson(
-                FamilyTreePersonInsert(
-                    id: UUID(),
-                    familyId: session.familyId,
-                    memberId: member.id,
-                    displayName: member.displayName,
-                    birthYear: nil,
-                    deathYear: nil,
-                    photoURL: photo,
-                    isLiving: true,
-                    notes: nil,
-                    createdBy: session.me.id
+        if persons.isEmpty {
+            for member in session.members {
+                let photo = member.avatarURL ?? member.avatarPath
+                let person = try await insertPerson(
+                    FamilyTreePersonInsert(
+                        id: UUID(),
+                        familyId: session.familyId,
+                        memberId: member.id,
+                        displayName: member.displayName,
+                        birthYear: nil,
+                        deathYear: nil,
+                        photoURL: photo,
+                        isLiving: true,
+                        notes: nil,
+                        createdBy: session.me.id
+                    )
                 )
-            )
-            inserted[member.id] = person
-        }
-        persons = inserted.values.sorted { $0.displayName.localizedCompare($1.displayName) == .orderedAscending }
-
-        let parents = session.members.filter { $0.role == "owner" || $0.role == "parent" || $0.role == "adult" }
-        let children = session.members.filter { $0.role == "child" }
-
-        if parents.count == 2,
-           let a = inserted[parents[0].id],
-           let b = inserted[parents[1].id] {
-            let pair = canonicalPartnerPair(a.id, b.id)
-            let link = try await insertLink(
-                FamilyTreeLinkInsert(
-                    id: UUID(),
-                    familyId: session.familyId,
-                    fromPersonId: pair.0,
-                    toPersonId: pair.1,
-                    linkType: FamilyTreeLinkType.partnerOf.rawValue,
-                    createdBy: session.me.id
-                )
-            )
-            links.append(link)
+                inserted[member.id] = person
+            }
+            persons = inserted.values.sorted { $0.displayName.localizedCompare($1.displayName) == .orderedAscending }
+        } else {
+            for person in persons {
+                if let memberId = person.memberId {
+                    inserted[memberId] = person
+                }
+            }
         }
 
-        for parent in parents {
-            guard let from = inserted[parent.id] else { continue }
-            for child in children {
-                guard let to = inserted[child.id] else { continue }
+        if links.isEmpty {
+            let parents = session.members.filter { $0.role == "owner" || $0.role == "parent" || $0.role == "adult" }
+            let children = session.members.filter { $0.role == "child" }
+
+            if parents.count == 2,
+               let a = inserted[parents[0].id],
+               let b = inserted[parents[1].id] {
+                let pair = Self.canonicalPartnerPair(a.id, b.id)
                 let link = try await insertLink(
                     FamilyTreeLinkInsert(
                         id: UUID(),
                         familyId: session.familyId,
-                        fromPersonId: from.id,
-                        toPersonId: to.id,
-                        linkType: FamilyTreeLinkType.parentOf.rawValue,
+                        fromPersonId: pair.0,
+                        toPersonId: pair.1,
+                        linkType: FamilyTreeLinkType.partnerOf.rawValue,
                         createdBy: session.me.id
                     )
                 )
                 links.append(link)
+            }
+
+            for parent in parents {
+                guard let from = inserted[parent.id] else { continue }
+                for child in children {
+                    guard let to = inserted[child.id] else { continue }
+                    let link = try await insertLink(
+                        FamilyTreeLinkInsert(
+                            id: UUID(),
+                            familyId: session.familyId,
+                            fromPersonId: from.id,
+                            toPersonId: to.id,
+                            linkType: FamilyTreeLinkType.parentOf.rawValue,
+                            createdBy: session.me.id
+                        )
+                    )
+                    links.append(link)
+                }
             }
         }
 
@@ -154,8 +164,8 @@ final class FamilyTreeRepository {
     }
 
     func openDirectChat(memberId: UUID) async throws -> UUID {
-        let summary: DirectChatSummary = try await client
-            .rpc("get_or_create_direct_chat", params: DirectChatParams(pMemberId: memberId))
+        let summary: FamilyTreeDirectChatSummary = try await client
+            .rpc("get_or_create_direct_chat", params: FamilyTreeDirectChatParams(pMemberId: memberId))
             .execute()
             .value
         return summary.id
@@ -182,8 +192,8 @@ final class FamilyTreeRepository {
             _ = try await client
                 .rpc(
                     "create_family_post",
-                    params: FamilyPostCreateParams(
-                        pPost: FamilyPostCreateBody(id: newPostId, caption: caption, photoPaths: [path])
+                    params: FamilyTreePostCreateParams(
+                        pPost: FamilyTreePostCreateBody(id: newPostId, caption: caption, photoPaths: [path])
                     )
                 )
                 .execute()
@@ -224,7 +234,7 @@ final class FamilyTreeRepository {
         return scaled.jpegData(compressionQuality: 0.82)
     }
 
-    static func canonicalPartnerPair(_ a: UUID, _ b: UUID) -> (UUID, UUID) {
+    nonisolated static func canonicalPartnerPair(_ a: UUID, _ b: UUID) -> (UUID, UUID) {
         a.uuidString < b.uuidString ? (a, b) : (b, a)
     }
 }
